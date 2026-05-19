@@ -319,6 +319,12 @@ struct ChunkFooter {
     ptr: Cell<NonNull<u8>>,
 }
 
+#[derive(Clone, Copy)]
+struct Checkpoint {
+    footer: NonNull<ChunkFooter>,
+    ptr: NonNull<u8>,
+}
+
 /// A wrapper type for the canonical, statically allocated empty chunk.
 ///
 /// For the canonical empty chunk to be `static`, its type must be `Sync`, which
@@ -2200,6 +2206,17 @@ impl<const MIN_ALIGN: usize> Bump<MIN_ALIGN> {
         self.allocated_bytes.get()
     }
 
+    /// Passes the closure an allocator whose allocations are deleted
+    /// upon its return.
+    pub fn with_stack_frame<F>(&mut self, f: F)
+    where
+        F: FnOnce(&mut Bump<MIN_ALIGN>) -> (),
+    {
+        let checkpoint = self.checkpoint();
+        f(self);
+        unsafe { self.restore(checkpoint) };
+    }
+
     /// Calculates the number of bytes requested from the Rust allocator for this `Bump`.
     ///
     /// This number is equal to the [`allocated_bytes()`](Self::allocated_bytes) plus
@@ -2361,6 +2378,33 @@ impl<const MIN_ALIGN: usize> Bump<MIN_ALIGN> {
         let new_ptr = self.try_alloc_layout(new_layout)?;
         ptr::copy_nonoverlapping(ptr.as_ptr(), new_ptr.as_ptr(), old_size);
         Ok(new_ptr)
+    }
+
+    fn checkpoint(&mut self) -> Checkpoint {
+        let footer = self.current_chunk_footer.get();
+        Checkpoint {
+            footer,
+            ptr: unsafe { footer.as_ref().ptr.get() },
+        }
+    }
+
+    // Restore a checkpoint, invalidating any allocations that came after it.
+    unsafe fn restore(&mut self, checkpoint: Checkpoint) {
+        loop {
+            let f = self.current_chunk_footer.get();
+            if f == checkpoint.footer {
+                break;
+            }
+            self.current_chunk_footer.set(f.as_ref().prev.get());
+
+            let freed_size = f.as_ref().layout.size() - FOOTER_SIZE;
+            self.allocated_bytes
+                .set(self.allocated_bytes.get() - freed_size);
+
+            dealloc(f.as_ref().data.as_ptr(), f.as_ref().layout);
+        }
+        let f = self.current_chunk_footer.get().as_mut();
+        f.ptr.set(checkpoint.ptr);
     }
 }
 
@@ -2653,5 +2697,43 @@ mod tests {
             let l3 = Layout::from_size_align(24000, 4).unwrap();
             b.realloc(p1, l3, 48000).unwrap();
         }
+    }
+
+    // Tests that the state before some stack allocation matches after the closure's return
+    fn test_stack_frame<F>(b: &mut Bump, f: F)
+    where
+        F: FnOnce(&mut Bump) -> (),
+    {
+        b.alloc(12u32);
+        let prev_allocated_bytes = b.allocated_bytes();
+        let prev_ptr = unsafe { b.current_chunk_footer.get().as_ref().ptr.as_ptr() };
+        b.with_stack_frame(f);
+        assert_eq!(b.allocated_bytes(), prev_allocated_bytes);
+        let new_ptr = unsafe { b.current_chunk_footer.get().as_ref().ptr.as_ptr() };
+        assert_eq!(new_ptr, prev_ptr);
+    }
+
+    #[test]
+    fn stack_frame() {
+        let mut b = Bump::new();
+        b.alloc(2u8);
+        test_stack_frame(&mut b, |c| {
+            c.alloc(1u8);
+        });
+
+        b.alloc(3u8);
+        test_stack_frame(&mut b, |c| {
+            c.alloc_slice_fill_copy(DEFAULT_CHUNK_SIZE_WITHOUT_FOOTER, 1u8);
+            assert!(c.allocated_bytes() > DEFAULT_CHUNK_SIZE_WITHOUT_FOOTER * 2);
+        });
+
+        b.alloc(4u8);
+        test_stack_frame(&mut b, |c| {
+            c.alloc_slice_fill_copy(DEFAULT_CHUNK_SIZE_WITHOUT_FOOTER, 1u8);
+            assert!(c.allocated_bytes() > DEFAULT_CHUNK_SIZE_WITHOUT_FOOTER * 2);
+            test_stack_frame(c, |d| {
+                d.alloc(5u8);
+            });
+        });
     }
 }
