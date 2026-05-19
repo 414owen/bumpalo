@@ -293,6 +293,9 @@ pub struct Bump<const MIN_ALIGN: usize = 1> {
     // The current chunk we are bump allocating within.
     current_chunk_footer: Cell<NonNull<ChunkFooter>>,
     allocation_limit: Cell<Option<usize>>,
+
+    // The bytes allocated in all chunks so far.
+    allocated_bytes: Cell<usize>,
 }
 
 #[repr(C)]
@@ -314,12 +317,6 @@ struct ChunkFooter {
 
     // Bump allocation finger that is always in the range `self.data..=self`.
     ptr: Cell<NonNull<u8>>,
-
-    // The bytes allocated in all chunks so far, the canonical empty chunk has
-    // a size of 0 and for all other chunks, `allocated_bytes` will be
-    // the allocated_bytes of the current chunk plus the allocated bytes
-    // of the `prev` chunk.
-    allocated_bytes: usize,
 }
 
 /// A wrapper type for the canonical, statically allocated empty chunk.
@@ -349,9 +346,6 @@ static EMPTY_CHUNK: EmptyChunkFooter = EmptyChunkFooter(ChunkFooter {
     prev: Cell::new(unsafe {
         NonNull::new_unchecked(&EMPTY_CHUNK as *const EmptyChunkFooter as *mut ChunkFooter)
     }),
-
-    // Empty chunks count as 0 allocated bytes in an arena.
-    allocated_bytes: 0,
 });
 
 impl EmptyChunkFooter {
@@ -636,6 +630,7 @@ impl<const MIN_ALIGN: usize> Bump<MIN_ALIGN> {
         Bump {
             current_chunk_footer: Cell::new(EMPTY_CHUNK.get()),
             allocation_limit: Cell::new(None),
+            allocated_bytes: Cell::new(0),
         }
     }
 
@@ -720,23 +715,23 @@ impl<const MIN_ALIGN: usize> Bump<MIN_ALIGN> {
             return Ok(Bump {
                 current_chunk_footer: Cell::new(EMPTY_CHUNK.get()),
                 allocation_limit: Cell::new(None),
+                allocated_bytes: Cell::new(0),
             });
         }
 
         let layout = layout_from_size_align(capacity, MIN_ALIGN)?;
 
+        let new_chunk_memory = Self::new_chunk_memory_details(None, layout).ok_or(AllocErr)?;
+        let allocated_bytes = new_chunk_memory.new_size_without_footer;
+
         let chunk_footer = unsafe {
-            Self::new_chunk(
-                Self::new_chunk_memory_details(None, layout).ok_or(AllocErr)?,
-                layout,
-                EMPTY_CHUNK.get(),
-            )
-            .ok_or(AllocErr)?
+            Self::new_chunk(new_chunk_memory, layout, EMPTY_CHUNK.get()).ok_or(AllocErr)?
         };
 
         Ok(Bump {
             current_chunk_footer: Cell::new(chunk_footer),
             allocation_limit: Cell::new(None),
+            allocated_bytes: Cell::new(allocated_bytes),
         })
     }
 
@@ -920,10 +915,6 @@ impl<const MIN_ALIGN: usize> Bump<MIN_ALIGN> {
 
         let ptr = Cell::new(NonNull::new_unchecked(ptr));
 
-        // The `allocated_bytes` of a new chunk counts the total size
-        // of the chunks, not how much of the chunks are used.
-        let allocated_bytes = prev.as_ref().allocated_bytes + new_size_without_footer;
-
         ptr::write(
             footer_ptr,
             ChunkFooter {
@@ -931,7 +922,6 @@ impl<const MIN_ALIGN: usize> Bump<MIN_ALIGN> {
                 layout,
                 prev: Cell::new(prev),
                 ptr,
-                allocated_bytes,
             },
         );
 
@@ -977,7 +967,7 @@ impl<const MIN_ALIGN: usize> Bump<MIN_ALIGN> {
                 return;
             }
 
-            let mut cur_chunk = self.current_chunk_footer.get();
+            let cur_chunk = self.current_chunk_footer.get();
 
             // Deallocate all chunks except the current one
             let prev_chunk = cur_chunk.as_ref().prev.replace(EMPTY_CHUNK.get());
@@ -990,8 +980,9 @@ impl<const MIN_ALIGN: usize> Bump<MIN_ALIGN> {
             );
             cur_chunk.as_ref().ptr.set(cur_chunk.cast());
 
-            // Reset the allocated size of the chunk.
-            cur_chunk.as_mut().allocated_bytes = cur_chunk.as_ref().layout.size() - FOOTER_SIZE;
+            // Reset the allocated bytes to just the current chunk.
+            self.allocated_bytes
+                .set(cur_chunk.as_ref().layout.size() - FOOTER_SIZE);
 
             debug_assert!(
                 self.current_chunk_footer
@@ -2055,6 +2046,10 @@ impl<const MIN_ALIGN: usize> Bump<MIN_ALIGN> {
             // Set the new chunk as our new current chunk.
             self.current_chunk_footer.set(new_footer);
 
+            let new_size_without_footer = new_footer.as_ref().layout.size() - FOOTER_SIZE;
+            self.allocated_bytes
+                .set(self.allocated_bytes.get() + new_size_without_footer);
+
             // And then we can rely on `try_alloc_layout_fast` to allocate
             // space within this chunk.
             let ptr = self.try_alloc_layout_fast(layout);
@@ -2202,9 +2197,7 @@ impl<const MIN_ALIGN: usize> Bump<MIN_ALIGN> {
     /// assert!(bytes >= core::mem::size_of::<u32>() * 5);
     /// ```
     pub fn allocated_bytes(&self) -> usize {
-        let footer = self.current_chunk_footer.get();
-
-        unsafe { footer.as_ref().allocated_bytes }
+        self.allocated_bytes.get()
     }
 
     /// Calculates the number of bytes requested from the Rust allocator for this `Bump`.
